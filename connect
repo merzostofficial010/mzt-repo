@@ -1,0 +1,402 @@
+#!/data/data/com.termux/files/usr/bin/python
+import sys
+import os
+import re
+import json
+import time
+import threading
+import urllib.request
+import urllib.parse
+import getpass
+import http.client
+
+GITHUB_USER = "merzostofficial010"
+GITHUB_REPO = "mzt-repo"
+RAW_BASE = "https://raw.githubusercontent.com/%s/%s/main/" % (GITHUB_USER, GITHUB_REPO)
+UA = "Mozilla/5.0"
+MAX_FILE = 90 * 1024 * 1024
+BLOCK = 64 * 1024
+
+ERRS = {
+    "nouser": "Пользователь не найден.",
+    "badpass": "Неверный пароль.",
+    "invite": "Неверный код приглашения.",
+    "name": "Логин: 3-16 символов, только буквы, цифры и _.",
+    "short": "Пароль слишком короткий (минимум 6 символов).",
+    "taken": "Такой логин уже занят.",
+    "auth": "Сессия истекла.",
+    "big": "Файл больше 90 МБ.",
+    "nofile": "Файл не найден.",
+    "server": "Ошибка сервера.",
+}
+
+
+def human_size(n):
+    if n < 1024:
+        return "%d Б" % n
+    n = float(n)
+    for unit in ("КБ", "МБ", "ГБ"):
+        n /= 1024.0
+        if n < 1024 or unit == "ГБ":
+            return "%.1f %s" % (n, unit)
+
+
+def fetch_address(name):
+    url = RAW_BASE + name + ".txt"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.read().decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+
+def http_json(base, endpoint, payload, timeout=30):
+    url = base.rstrip("/") + endpoint
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": UA},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def open_conn(base, timeout=120):
+    u = urllib.parse.urlparse(base)
+    host = u.hostname
+    prefix = u.path.rstrip("/")
+    if u.scheme == "https":
+        conn = http.client.HTTPSConnection(host, u.port or 443, timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(host, u.port or 80, timeout=timeout)
+    return conn, prefix
+
+
+def sanitize_local(name):
+    name = os.path.basename(str(name or ""))
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    name = name.lstrip(".")
+    if not name or name in (".", ".."):
+        return ""
+    return name
+
+
+class Client:
+    def __init__(self, base, login, password):
+        self.base = base.rstrip("/")
+        self.login = login
+        self.password = password
+        self.token = None
+        self.nick = login
+        self.lock = threading.Lock()
+        self.print_lock = threading.Lock()
+        self.stop = False
+
+    def message(self, line):
+        with self.print_lock:
+            try:
+                sys.stdout.write("\r\033[K" + line + "\n> ")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    def say(self, line):
+        with self.print_lock:
+            try:
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    def get_token(self):
+        with self.lock:
+            return self.token
+
+    def set_login(self, result):
+        with self.lock:
+            self.token = result["token"]
+            self.nick = result.get("nick", self.login)
+
+    def relogin(self):
+        for _ in range(3):
+            try:
+                r = http_json(self.base, "/login", {"login": self.login, "password": self.password})
+            except Exception:
+                time.sleep(1)
+                continue
+            if r.get("ok"):
+                self.set_login(r)
+                return True
+            if r.get("e") in ("nouser", "badpass"):
+                return False
+            time.sleep(1)
+        return False
+
+    def api(self, endpoint, payload=None, timeout=30):
+        d = dict(payload or {})
+        d["token"] = self.get_token()
+        return http_json(self.base, endpoint, d, timeout=timeout)
+
+    def call(self, endpoint, payload=None, timeout=30):
+        r = self.api(endpoint, payload, timeout)
+        if r.get("e") == "auth":
+            if self.relogin():
+                r = self.api(endpoint, payload, timeout)
+        return r
+
+    def poll_loop(self):
+        since = None
+        while not self.stop:
+            try:
+                r = self.call("/poll", {"since": since}, timeout=45)
+            except Exception:
+                if self.stop:
+                    break
+                time.sleep(2)
+                continue
+            if r.get("ok"):
+                for m in r.get("msgs", []):
+                    self.show(m)
+                since = r.get("n", since)
+            elif r.get("e") == "auth":
+                if not self.relogin():
+                    self.message("Сессия потеряна. Перезапустите connect.")
+                    self.stop = True
+                    break
+            else:
+                time.sleep(1)
+
+    def show(self, m):
+        stamp = time.strftime("%H:%M", time.localtime(float(m.get("t") or time.time())))
+        if m.get("sys"):
+            line = "[%s] * %s" % (stamp, m.get("text", ""))
+        else:
+            line = "[%s] %s: %s" % (stamp, m.get("nick", ""), m.get("text", ""))
+        self.message(line)
+
+    def upload(self, path, name, size):
+        conn, prefix = open_conn(self.base)
+        try:
+            conn.putrequest("POST", prefix + "/upload")
+            conn.putheader("User-Agent", UA)
+            conn.putheader("X-Token", self.get_token() or "")
+            conn.putheader("X-Name", urllib.parse.quote(name, safe=""))
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(size))
+            conn.endheaders()
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(BLOCK)
+                    if not chunk:
+                        break
+                    conn.send(chunk)
+            resp = conn.getresponse()
+            body = resp.read()
+            try:
+                return json.loads(body.decode("utf-8"))
+            except Exception:
+                return {"e": "server"}
+        finally:
+            conn.close()
+
+    def cmd_send(self, path):
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            self.say("Файл не найден.")
+            return
+        size = os.path.getsize(path)
+        if size > MAX_FILE:
+            self.say("Файл больше 90 МБ.")
+            return
+        name = os.path.basename(path)
+        self.say("Отправка %s (%s)..." % (name, human_size(size)))
+        try:
+            r = self.upload(path, name, size)
+            if r.get("e") == "auth" and self.relogin():
+                r = self.upload(path, name, size)
+        except Exception as e:
+            self.say("Ошибка отправки: %s" % e)
+            return
+        if r.get("ok"):
+            self.say("Отправлено: %s (%s)" % (r.get("name", name), human_size(r.get("size", size))))
+        else:
+            self.say("Ошибка: " + ERRS.get(r.get("e"), "неизвестно"))
+
+    def cmd_files(self):
+        try:
+            r = self.call("/files", {})
+        except Exception as e:
+            self.say("Ошибка: %s" % e)
+            return
+        if not r.get("ok"):
+            self.say("Ошибка: " + ERRS.get(r.get("e"), "неизвестно"))
+            return
+        files = r.get("files") or []
+        if not files:
+            self.say("Файлов пока нет.")
+            return
+        self.say("Файлы:")
+        for f in files:
+            self.say("  %s  (%s)" % (f.get("name"), human_size(f.get("size", 0))))
+
+    def download(self, name, destdir):
+        payload = json.dumps({"token": self.get_token(), "name": name}).encode("utf-8")
+        conn, prefix = open_conn(self.base)
+        try:
+            conn.putrequest("POST", prefix + "/get")
+            conn.putheader("User-Agent", UA)
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", str(len(payload)))
+            conn.endheaders()
+            conn.send(payload)
+            resp = conn.getresponse()
+            ctype = resp.getheader("Content-Type", "") or ""
+            if "application/json" in ctype:
+                body = resp.read()
+                try:
+                    return json.loads(body.decode("utf-8")), None
+                except Exception:
+                    return {"e": "server"}, None
+            safe = sanitize_local(name)
+            if not safe:
+                return {"e": "nofile"}, None
+            path = os.path.join(destdir, safe)
+            part = path + ".part"
+            with open(part, "wb") as f:
+                while True:
+                    chunk = resp.read(BLOCK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            os.replace(part, path)
+            return {"ok": 1, "size": os.path.getsize(path)}, path
+        finally:
+            conn.close()
+
+    def cmd_get(self, name):
+        destdir = os.path.expanduser("~/storage/downloads/mzt")
+        try:
+            os.makedirs(destdir, exist_ok=True)
+            if not os.path.isdir(destdir):
+                raise OSError
+        except Exception:
+            destdir = os.path.expanduser("~/mzt")
+            os.makedirs(destdir, exist_ok=True)
+        self.say("Скачивание %s..." % name)
+        try:
+            r, path = self.download(name, destdir)
+            if r.get("e") == "auth" and self.relogin():
+                r, path = self.download(name, destdir)
+        except Exception as e:
+            self.say("Ошибка скачивания: %s" % e)
+            return
+        if r.get("ok") and path:
+            self.say("Сохранено: %s (%s)" % (path, human_size(r.get("size", 0))))
+            self.say("Файл не запускается автоматически.")
+        else:
+            self.say("Ошибка: " + ERRS.get(r.get("e"), "неизвестно"))
+
+    def input_loop(self):
+        while not self.stop:
+            try:
+                line = input("> ")
+            except (EOFError, KeyboardInterrupt):
+                self.stop = True
+                break
+            line = line.strip()
+            if not line:
+                continue
+            if line == "/exit":
+                self.stop = True
+                break
+            if line == "/files":
+                self.cmd_files()
+            elif line.startswith("/send "):
+                self.cmd_send(line[6:].strip())
+            elif line == "/send":
+                self.say("Использование: /send путь_к_файлу")
+            elif line.startswith("/get "):
+                self.cmd_get(line[5:].strip())
+            elif line == "/get":
+                self.say("Использование: /get имя_файла")
+            elif line.startswith("/"):
+                self.say("Команды: /send путь, /files, /get имя, /exit")
+            else:
+                try:
+                    r = self.call("/send", {"text": line})
+                except Exception as e:
+                    self.say("Не отправлено: %s" % e)
+                    continue
+                if not r.get("ok"):
+                    self.say("Не отправлено: " + ERRS.get(r.get("e"), "ошибка"))
+
+
+def main():
+    name = sys.argv[1] if len(sys.argv) > 1 else "mzt"
+    name = re.sub(r"[^A-Za-z0-9._-]", "", name)
+    if not name:
+        name = "mzt"
+    print("Поиск сервера...")
+    addr = fetch_address(name)
+    if not addr or not (addr.startswith("http://") or addr.startswith("https://")):
+        print("Сервер не найден. Возможно, чат сейчас выключен.")
+        return
+    print("Сервер: %s" % addr)
+
+    login = input("Логин: ").strip()
+    if not login:
+        print("Логин не может быть пустым.")
+        return
+    password = getpass.getpass("Пароль: ")
+    try:
+        r = http_json(addr, "/login", {"login": login, "password": password})
+    except Exception as e:
+        print("Не удалось связаться с сервером: %s" % e)
+        return
+
+    if r.get("e") == "nouser":
+        ans = input("Аккаунта нет. Создать? (y/n): ").strip().lower()
+        if ans != "y":
+            return
+        invite = input("Код приглашения: ").strip()
+        try:
+            r2 = http_json(
+                addr,
+                "/register",
+                {"login": login, "password": password, "invite": invite},
+            )
+        except Exception as e:
+            print("Не удалось связаться с сервером: %s" % e)
+            return
+        if not r2.get("ok"):
+            print(ERRS.get(r2.get("e"), "Не удалось создать аккаунт."))
+            return
+        print("Аккаунт создан. Входим...")
+        try:
+            r = http_json(addr, "/login", {"login": login, "password": password})
+        except Exception as e:
+            print("Не удалось войти: %s" % e)
+            return
+
+    if not r.get("ok"):
+        print(ERRS.get(r.get("e"), "Не удалось войти."))
+        return
+
+    cli = Client(addr, login, password)
+    cli.set_login(r)
+    print("\nВы вошли как %s." % cli.nick)
+    print("Команды: /send путь_к_файлу, /files, /get имя_файла, /exit")
+    print("Пишите сообщение и нажмите Enter.\n")
+    threading.Thread(target=cli.poll_loop, daemon=True).start()
+    try:
+        cli.input_loop()
+    finally:
+        cli.stop = True
+    print("Выход.")
+
+
+if __name__ == "__main__":
+    main()
