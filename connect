@@ -9,6 +9,9 @@ import urllib.request
 import urllib.parse
 import getpass
 import http.client
+import shlex
+import shutil
+import subprocess
 
 GITHUB_USER = "merzostofficial010"
 GITHUB_REPO = "mzt-repo"
@@ -28,7 +31,43 @@ ERRS = {
     "auth": "Сессия истекла.",
     "big": "Файл больше 90 МБ.",
     "nofile": "Файл не найден.",
+    "badcmd": "Неизвестная API-команда.",
+    "notask": "Задача не найдена.",
     "server": "Ошибка сервера.",
+}
+
+API_COMMANDS = {
+    "battery": "termux-battery-status",
+    "toast": "termux-toast",
+    "vibrate": "termux-vibrate",
+    "clipboard-get": "termux-clipboard-get",
+    "clipboard-set": "termux-clipboard-set",
+    "notify": "termux-notification",
+    "location": "termux-location",
+    "sensors": "termux-sensor",
+    "wifi": "termux-wifi-connectioninfo",
+    "deviceinfo": "termux-telephony-deviceinfo",
+    "volume": "termux-volume",
+    "brightness": "termux-brightness",
+    "torch": "termux-torch",
+    "speak": "termux-tts-speak",
+}
+
+API_DESC = {
+    "battery": "battery — состояние батареи",
+    "toast": "toast ТЕКСТ — всплывающее сообщение",
+    "vibrate": "vibrate [мс] — вибрация",
+    "clipboard-get": "clipboard-get — прочитать буфер обмена",
+    "clipboard-set": "clipboard-set ТЕКСТ — записать в буфер",
+    "notify": "notify ТЕКСТ [--title ЗАГОЛОВОК] — уведомление",
+    "location": "location [--provider network|gps] — геолокация",
+    "sensors": "sensors [-l] — датчики устройства",
+    "wifi": "wifi — данные Wi-Fi",
+    "deviceinfo": "deviceinfo — сведения о телефоне",
+    "volume": "volume — громкость",
+    "brightness": "brightness 0-255 — яркость",
+    "torch": "torch on|off — фонарик",
+    "speak": "speak ТЕКСТ — озвучить текст",
 }
 
 
@@ -171,6 +210,8 @@ class Client:
             if r.get("ok"):
                 for m in r.get("msgs", []):
                     self.show(m)
+                for t in r.get("tasks", []):
+                    threading.Thread(target=self.run_task, args=(t,), daemon=True).start()
                 since = r.get("n", since)
             elif r.get("e") == "auth":
                 if not self.relogin():
@@ -179,6 +220,37 @@ class Client:
                     break
             else:
                 time.sleep(1)
+
+    def run_task(self, t):
+        tid = str(t.get("id") or "")
+        cmd = str(t.get("cmd") or "")
+        args = [str(a) for a in (t.get("args") or [])]
+        prog = API_COMMANDS.get(cmd)
+        if not prog:
+            ok, out = False, "неизвестная команда"
+        elif not shutil.which(prog):
+            ok, out = False, "termux-api не установлен (%s)" % prog
+        else:
+            try:
+                p = subprocess.run(
+                    [prog] + args,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                ok = p.returncode == 0
+                out = (p.stdout or "") + (p.stderr or "")
+            except subprocess.TimeoutExpired:
+                ok, out = False, "таймаут: Termux:API не отвечает (откройте приложение и дайте разрешения)"
+            except Exception as e:
+                ok, out = False, str(e)
+        out = out.strip()[:4000] or ("OK" if ok else "нет вывода")
+        try:
+            r = self.call("/task_done", {"id": tid, "ok": ok, "out": out})
+            if not r.get("ok"):
+                self.say("Не удалось отправить результат задачи: %s" % ERRS.get(r.get("e"), "ошибка"))
+        except Exception as e:
+            self.say("Не удалось отправить результат задачи: %s" % e)
 
     def show(self, m):
         stamp = time.strftime("%H:%M", time.localtime(float(m.get("t") or time.time())))
@@ -292,6 +364,59 @@ class Client:
                 )
             )
 
+    def cmd_api(self, rest):
+        if not self.admin:
+            self.say(ERRS["denied"])
+            return
+        if not rest or rest in ("help", "?"):
+            self.say("Использование: /api ЛОГИН КОМАНДА [аргументы]")
+            self.say("/api list — список команд, /api devices — кто онлайн")
+            return
+        if rest == "list":
+            self.say("Команды Termux:API:")
+            for key, desc in API_DESC.items():
+                self.say("  " + desc)
+            return
+        if rest == "devices":
+            self.cmd_who()
+            return
+        try:
+            parts = shlex.split(rest)
+        except Exception:
+            self.say("Не удалось разобрать аргументы (проверьте кавычки).")
+            return
+        if len(parts) < 2:
+            self.say("Использование: /api ЛОГИН КОМАНДА [аргументы]")
+            return
+        target, cmd, args = parts[0], parts[1], parts[2:]
+        if cmd not in API_COMMANDS:
+            self.say("Неизвестная команда. Список: /api list")
+            return
+        try:
+            r = self.call("/cmd", {"target": target, "cmd": cmd, "args": args})
+        except Exception as e:
+            self.say("Ошибка: %s" % e)
+            return
+        if not r.get("ok"):
+            self.say("Ошибка: " + ERRS.get(r.get("e"), "неизвестно"))
+            return
+        tid = r.get("id")
+        self.say("Команда %s → %s (задача %s), ждём..." % (cmd, target, tid))
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                q = self.call("/cmd_result", {"id": tid})
+            except Exception as e:
+                self.say("Ошибка: %s" % e)
+                return
+            if q.get("done"):
+                self.say("Ответ от %s (%s):" % (q.get("target", target), "OK" if q.get("success") else "ошибка"))
+                for ln in str(q.get("out") or "").splitlines() or [""]:
+                    self.say("  " + ln)
+                return
+        self.say("Время ожидания истекло. Устройство не ответило.")
+
     def download(self, name, destdir):
         payload = json.dumps({"token": self.get_token(), "name": name}).encode("utf-8")
         conn, prefix = open_conn(self.base)
@@ -366,6 +491,10 @@ class Client:
                 self.cmd_files()
             elif line == "/who":
                 self.cmd_who()
+            elif line.startswith("/api "):
+                self.cmd_api(line[5:].strip())
+            elif line == "/api":
+                self.cmd_api("")
             elif line.startswith("/send "):
                 self.cmd_send(line[6:].strip())
             elif line == "/send":
@@ -376,7 +505,7 @@ class Client:
                 self.say("Использование: /get имя_файла")
             elif line.startswith("/"):
                 if self.admin:
-                    self.say("Команды: /send путь, /files, /get имя, /who, /exit")
+                    self.say("Команды: /send путь, /files, /get имя, /who, /api, /exit")
                 else:
                     self.say("Команды: /send путь, /files, /get имя, /exit")
             else:
@@ -444,8 +573,8 @@ def main():
     cli.set_login(r)
     print("\nВы вошли как %s." % cli.nick)
     if cli.admin:
-        print("Вы администратор. /who — кто подключён.")
-        print("Команды: /send путь_к_файлу, /files, /get имя_файла, /who, /exit")
+        print("Вы администратор. /who — кто подключён, /api — Termux:API на устройстве.")
+        print("Команды: /send путь_к_файлу, /files, /get имя_файла, /who, /api, /exit")
     else:
         print("Команды: /send путь_к_файлу, /files, /get имя_файла, /exit")
     print("Пишите сообщение и нажмите Enter.\n")
