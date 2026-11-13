@@ -33,6 +33,7 @@ ERRS = {
     "nofile": "Файл не найден.",
     "badcmd": "Неизвестная API-команда.",
     "notask": "Задача не найдена.",
+    "noshell": "На устройстве не разрешён shell (allow_shell в настройках клиента).",
     "server": "Ошибка сервера.",
 }
 
@@ -133,13 +134,16 @@ def sanitize_local(name):
 
 
 class Client:
-    def __init__(self, base, login, password):
+    def __init__(self, base, login, password, name=None, allow_shell=False, daemon=False):
         self.base = base.rstrip("/")
         self.login = login
         self.password = password
         self.token = None
         self.nick = login
         self.admin = False
+        self.name = name
+        self.allow_shell = bool(allow_shell)
+        self.daemon = bool(daemon)
         self.lock = threading.Lock()
         self.print_lock = threading.Lock()
         self.stop = False
@@ -197,54 +201,99 @@ class Client:
                 r = self.api(endpoint, payload, timeout)
         return r
 
+    def caps(self):
+        caps = ["api"]
+        if self.allow_shell:
+            caps.append("shell")
+        return caps
+
+    def refresh_address(self):
+        if not self.name:
+            return
+        addr = fetch_address(self.name)
+        if addr and addr != self.base:
+            self.base = addr.rstrip("/")
+            self.say("Новый адрес сервера: %s" % self.base)
+
     def poll_loop(self):
         since = None
+        fails = 0
         while not self.stop:
             try:
-                r = self.call("/poll", {"since": since}, timeout=45)
+                r = self.call(
+                    "/poll",
+                    {"since": since, "caps": self.caps()},
+                    timeout=45,
+                )
             except Exception:
                 if self.stop:
                     break
-                time.sleep(2)
+                fails += 1
+                time.sleep(min(30, 2 * fails))
+                if fails % 6 == 0:
+                    self.refresh_address()
                 continue
+            fails = 0
             if r.get("ok"):
                 for m in r.get("msgs", []):
                     self.show(m)
                 for t in r.get("tasks", []):
                     threading.Thread(target=self.run_task, args=(t,), daemon=True).start()
-                since = r.get("n", since)
+                n = r.get("n")
+                if n is None:
+                    continue
+                if since is not None and n < since:
+                    since = None
+                else:
+                    since = n
             elif r.get("e") == "auth":
-                if not self.relogin():
-                    self.message("Сессия потеряна. Перезапустите connect.")
-                    self.stop = True
-                    break
+                if self.relogin():
+                    continue
+                if self.daemon:
+                    time.sleep(5)
+                    self.refresh_address()
+                    continue
+                self.message("Сессия потеряна. Перезапустите connect.")
+                self.stop = True
+                break
             else:
                 time.sleep(1)
+
+    @staticmethod
+    def run_proc(argv, timeout):
+        try:
+            p = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
+        except subprocess.TimeoutExpired:
+            return False, "таймаут выполнения (%d с)" % timeout
+        except Exception as e:
+            return False, str(e)
 
     def run_task(self, t):
         tid = str(t.get("id") or "")
         cmd = str(t.get("cmd") or "")
         args = [str(a) for a in (t.get("args") or [])]
-        prog = API_COMMANDS.get(cmd)
-        if not prog:
-            ok, out = False, "неизвестная команда"
-        elif not shutil.which(prog):
-            ok, out = False, "termux-api не установлен (%s)" % prog
+        if cmd == "shell":
+            if not self.allow_shell:
+                ok, out = False, "shell запрещён настройками этого устройства"
+            else:
+                ok, out = self.run_proc(["sh", "-c", " ".join(args)], 600)
         else:
-            try:
-                p = subprocess.run(
-                    [prog] + args,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                ok = p.returncode == 0
-                out = (p.stdout or "") + (p.stderr or "")
-            except subprocess.TimeoutExpired:
-                ok, out = False, "таймаут: Termux:API не отвечает (откройте приложение и дайте разрешения)"
-            except Exception as e:
-                ok, out = False, str(e)
-        out = out.strip()[:4000] or ("OK" if ok else "нет вывода")
+            prog = API_COMMANDS.get(cmd)
+            if not prog:
+                ok, out = False, "неизвестная команда"
+            elif not shutil.which(prog):
+                ok, out = False, "termux-api не установлен (%s)" % prog
+            else:
+                ok, out = self.run_proc([prog] + args, 30)
+                if not ok and "таймаут" in out:
+                    out = "таймаут: Termux:API не отвечает (откройте приложение и дайте разрешения)"
+        out = out.strip()[:12000] or ("OK" if ok else "нет вывода")
         try:
             r = self.call("/task_done", {"id": tid, "ok": ok, "out": out})
             if not r.get("ok"):
@@ -400,9 +449,36 @@ class Client:
         if not r.get("ok"):
             self.say("Ошибка: " + ERRS.get(r.get("e"), "неизвестно"))
             return
-        tid = r.get("id")
-        self.say("Команда %s → %s (задача %s), ждём..." % (cmd, target, tid))
-        deadline = time.time() + 45
+        self.wait_task(r.get("id"), target, cmd, 45)
+
+    def cmd_shell(self, rest):
+        if not self.admin:
+            self.say(ERRS["denied"])
+            return
+        parts = rest.split(None, 1)
+        if len(parts) < 2:
+            self.say("Использование: /shell ЛОГИН КОМАНДА  (например: /shell phone1 pkg install -y curl)")
+            return
+        target, command = parts[0], parts[1].strip()
+        if not command:
+            self.say("Пустая команда.")
+            return
+        try:
+            r = self.call("/cmd", {"target": target, "cmd": "shell", "args": [command]})
+        except Exception as e:
+            self.say("Ошибка: %s" % e)
+            return
+        if not r.get("ok"):
+            self.say("Ошибка: " + ERRS.get(r.get("e"), "неизвестно"))
+            return
+        self.say("Shell на %s: %s (ждём, до 10 мин)..." % (target, command))
+        self.wait_task(r.get("id"), target, "shell", 620)
+
+    def wait_task(self, tid, target, cmd, timeout):
+        if not tid:
+            self.say("Сервер не вернул задачу.")
+            return
+        deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(1)
             try:
@@ -412,7 +488,8 @@ class Client:
                 return
             if q.get("done"):
                 self.say("Ответ от %s (%s):" % (q.get("target", target), "OK" if q.get("success") else "ошибка"))
-                for ln in str(q.get("out") or "").splitlines() or [""]:
+                text = str(q.get("out") or "")
+                for ln in (text.splitlines() or [""]):
                     self.say("  " + ln)
                 return
         self.say("Время ожидания истекло. Устройство не ответило.")
@@ -495,6 +572,10 @@ class Client:
                 self.cmd_api(line[5:].strip())
             elif line == "/api":
                 self.cmd_api("")
+            elif line.startswith("/shell "):
+                self.cmd_shell(line[7:].strip())
+            elif line == "/shell":
+                self.cmd_shell("")
             elif line.startswith("/send "):
                 self.cmd_send(line[6:].strip())
             elif line == "/send":
@@ -505,7 +586,7 @@ class Client:
                 self.say("Использование: /get имя_файла")
             elif line.startswith("/"):
                 if self.admin:
-                    self.say("Команды: /send путь, /files, /get имя, /who, /api, /exit")
+                    self.say("Команды: /send путь, /files, /get имя, /who, /api, /shell, /exit")
                 else:
                     self.say("Команды: /send путь, /files, /get имя, /exit")
             else:
@@ -518,11 +599,87 @@ class Client:
                     self.say("Не отправлено: " + ERRS.get(r.get("e"), "ошибка"))
 
 
+CRED_FILE = os.path.expanduser("~/.mzt/credentials")
+
+
+def load_credentials():
+    login = os.environ.get("MZT_LOGIN", "").strip()
+    password = os.environ.get("MZT_PASSWORD", "")
+    allow = os.environ.get("MZT_ALLOW_SHELL", "").strip().lower() in ("1", "true", "yes", "on")
+    try:
+        with open(CRED_FILE, "r", encoding="utf-8") as f:
+            c = json.load(f)
+        if isinstance(c, dict):
+            login = login or str(c.get("login") or "").strip()
+            password = password or str(c.get("password") or "")
+            allow = allow or bool(c.get("allow_shell"))
+    except Exception:
+        pass
+    return login, password, allow
+
+
+def daemon_main(name):
+    print("MZT демон: запуск, сервер '%s'" % name, flush=True)
+    last = ""
+    while True:
+        login, password, allow = load_credentials()
+        if not login or not password:
+            msg = "Нет логина/пароля (~/.mzt/credentials или MZT_LOGIN/MZT_PASSWORD)."
+            if msg != last:
+                print(msg, flush=True)
+                last = msg
+            time.sleep(30)
+            continue
+        addr = fetch_address(name)
+        if not addr:
+            time.sleep(10)
+            continue
+        try:
+            r = http_json(addr, "/login", {"login": login, "password": password})
+        except Exception:
+            r = {"e": "server"}
+        if not r.get("ok"):
+            e = r.get("e")
+            msg = "Вход не удался: %s" % ERRS.get(e, e or "сервер недоступен")
+            if msg != last:
+                print(msg, flush=True)
+                last = msg
+            time.sleep(15)
+            continue
+        cli = Client(addr, login, password, name=name, allow_shell=allow, daemon=True)
+        cli.set_login(r)
+        print(
+            "Подключено как %s (%s). Shell: %s"
+            % (cli.nick, addr, "да" if allow else "нет"),
+            flush=True,
+        )
+        last = ""
+        try:
+            cli.poll_loop()
+        except KeyboardInterrupt:
+            cli.stop = True
+        if cli.stop:
+            break
+        time.sleep(5)
+    print("Демон остановлен.")
+
+
 def main():
-    name = sys.argv[1] if len(sys.argv) > 1 else "mzt"
-    name = re.sub(r"[^A-Za-z0-9._-]", "", name)
-    if not name:
-        name = "mzt"
+    raw = sys.argv[1:]
+    name = None
+    daemon = False
+    for a in raw:
+        if a in ("--daemon", "-d"):
+            daemon = True
+        elif not a.startswith("-") and name is None:
+            name = a
+    name = re.sub(r"[^A-Za-z0-9._-]", "", name or "mzt") or "mzt"
+    if daemon:
+        try:
+            daemon_main(name)
+        except KeyboardInterrupt:
+            pass
+        return
     print("Поиск сервера...")
     addr = fetch_address(name)
     if not addr or not (addr.startswith("http://") or addr.startswith("https://")):
@@ -569,12 +726,12 @@ def main():
         print(ERRS.get(r.get("e"), "Не удалось войти."))
         return
 
-    cli = Client(addr, login, password)
+    cli = Client(addr, login, password, name=name, allow_shell=load_credentials()[2])
     cli.set_login(r)
     print("\nВы вошли как %s." % cli.nick)
     if cli.admin:
-        print("Вы администратор. /who — кто подключён, /api — Termux:API на устройстве.")
-        print("Команды: /send путь_к_файлу, /files, /get имя_файла, /who, /api, /exit")
+        print("Вы администратор. /who — кто подключён, /api — Termux:API, /shell — команды Termux.")
+        print("Команды: /send путь_к_файлу, /files, /get имя_файла, /who, /api, /shell, /exit")
     else:
         print("Команды: /send путь_к_файлу, /files, /get имя_файла, /exit")
     print("Пишите сообщение и нажмите Enter.\n")
